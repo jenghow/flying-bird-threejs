@@ -1,0 +1,897 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bird Flight Simulator</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { overflow: hidden; background: #000; }
+        canvas { display: block; }
+        #hud {
+            position: fixed; top: 10px; left: 50%; transform: translateX(-50%);
+            color: #fff; font-family: 'Courier New', monospace; font-size: 13px;
+            text-shadow: 1px 1px 3px rgba(0,0,0,0.8); pointer-events: none; z-index: 100;
+            text-align: center; line-height: 1.6;
+        }
+        #startModal {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.7); display: flex; align-items: center; justify-content: center;
+            z-index: 999; flex-direction: column;
+        }
+        #startModal .box {
+            background: rgba(20,20,30,0.9); border: 1px solid rgba(255,255,255,0.15); border-radius: 12px;
+            padding: 40px 60px; text-align: center; color: #fff; font-family: 'Courier New', monospace;
+        }
+        #startModal h1 { font-size: 28px; margin-bottom: 8px; }
+        #startModal p { font-size: 15px; color: #ccc; margin-bottom: 20px; }
+        #startModal .key {
+            display: inline-block; background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.3);
+            border-radius: 6px; padding: 6px 16px; font-size: 16px; letter-spacing: 2px; color: #fff;
+        }
+        #startModal .hint { font-size: 12px; color: #888; margin-top: 18px; }
+        #fps {
+            position: fixed; bottom: 10px; right: 10px;
+            color: #fff; font-family: monospace; font-size: 12px;
+            pointer-events: none; z-index: 100;
+        }
+    </style>
+</head>
+<body>
+    <div id="hud">W/S: Speed &nbsp;|&nbsp; A/D: Turn &nbsp;|&nbsp; E: Flap &nbsp;|&nbsp; Q: Dive &nbsp;|&nbsp; Space: Pause<br><span id="stats"></span></div>
+    <div id="paused" style="display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);color:#fff;font-family:monospace;font-size:36px;text-shadow:2px 2px 6px rgba(0,0,0,0.8);pointer-events:none;z-index:200;">PAUSED</div>
+    <div id="startModal"><div class="box"><h1>Bird Flight Simulator</h1><p>Press <span class="key">SPACE</span> to start</p><p>W/S: Speed &nbsp;|&nbsp; A/D: Turn &nbsp;|&nbsp; E: Flap &nbsp;|&nbsp; Q: Dive</p><div class="hint">Space also pauses / resumes</div></div></div>
+    <script src="https://cdn.jsdelivr.net/npm/tone@14.8.49/build/Tone.js"></script>
+    <div id="fps"></div>
+    <div style="position:fixed;bottom:10px;left:10px;color:#fff;font-family:monospace;font-size:11px;pointer-events:none;z-index:100;opacity:0.7;">Author: JengHow Tan, June 2026. Made by MiMo V2.5. OpenCode.</div>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+            "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.20.0/+esm",
+            "simplex-noise": "https://cdn.jsdelivr.net/npm/simplex-noise@4.0.3/+esm"
+        }
+    }
+    </script>
+    <script type="module">
+import * as THREE from 'three';
+import { GUI } from 'lil-gui';
+import { createNoise2D } from 'simplex-noise';
+
+const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+function midiNoteName(n) { return NOTE_NAMES[n % 12] + (Math.floor(n / 12) - 1); }
+
+function parseMidi(buf) {
+    const d = new DataView(buf);
+    let p = 0;
+    const u8 = () => d.getUint8(p++);
+    const u16 = () => { const v = d.getUint16(p); p += 2; return v; };
+    const u32 = () => { const v = d.getUint32(p); p += 4; return v; };
+    const vlq = () => { let v = 0, b; do { b = u8(); v = (v << 7) | (b & 0x7F); } while (b & 0x80); return v; };
+    const str = (n) => { let s = ''; for (let i = 0; i < n; i++) s += String.fromCharCode(u8()); return s; };
+
+    if (str(4) !== 'MThd') throw new Error('Not MIDI');
+    const hdrLen = u32(); const fmt = u16(); const nTrk = u16(); const div = u16();
+    p += hdrLen - 6;
+
+    let tempo = 500000;
+    const events = [];
+
+    for (let t = 0; t < nTrk; t++) {
+        if (str(4) !== 'MTrk') throw new Error('Bad track');
+        const trkLen = u32(); const trkEnd = p + trkLen;
+        let run = 0, ticks = 0;
+        while (p < trkEnd) {
+            ticks += vlq();
+            let st = u8();
+            if (st === 0xFF) {
+                const mt = u8(); const ml = vlq();
+                if (mt === 0x51 && ml >= 3) tempo = (u8() << 16) | (u8() << 8) | u8();
+                else p += ml;
+                run = 0;
+            } else if (st === 0xF0 || st === 0xF7) { p += vlq(); run = 0; }
+            else {
+                if (st & 0x80) { run = st; } else { st = run; p--; }
+                const ty = st & 0xF0;
+                if (ty === 0x90) { const n = u8(); const v = u8(); if (v > 0) events.push({ t: 'on', tick: ticks, note: n, vel: v / 127, tempo }); }
+                else if (ty === 0x80) { const n = u8(); u8(); events.push({ t: 'off', tick: ticks, note: n }); }
+                else if (ty === 0xA0 || ty === 0xE0) { p += 2; }
+                else if (ty === 0xB0 || ty === 0xC0 || ty === 0xD0) { p++; }
+            }
+        }
+        p = trkEnd;
+    }
+
+    events.sort((a, b) => a.tick - b.tick);
+    let curTempo = 500000, lastTick = 0, lastTime = 0;
+    const notes = [], active = {};
+    for (const ev of events) {
+        if (ev.tempo) curTempo = ev.tempo;
+        lastTime += ((ev.tick - lastTick) * curTempo) / (div * 1e6);
+        lastTick = ev.tick;
+        if (ev.t === 'on') active[ev.note] = { time: lastTime, vel: ev.vel };
+        else if (active[ev.note]) {
+            notes.push({ time: active[ev.note].time, duration: Math.max(lastTime - active[ev.note].time, 0.05), note: ev.note, vel: active[ev.note].vel });
+            delete active[ev.note];
+        }
+    }
+    return { notes, duration: lastTime, bpm: 60e6 / curTempo };
+}
+
+const MIDI_B64 = 'TVRoZAAAAAYAAQAEAYBNVHJrAAAUKAD/WAQEAhgIAP9RAwknwAD/AwVGbHV0ZQDASaEAkEorgUCASgAAkEwrgUCATAAAkE4rgUCATgAAkEorgUCASgAAkFErg2CAUQBgkE4rgUCATgAAkEwrgiCATABgkFErgiCAUQBgkEwrAJBJK4IggEkAAIBMAGCQSiuBQIBKAACQRyuBQIBHAACQTiuDAJBHK2CATgBgkEorYIBHAGCASgAAkEkrgwCQRSuCIIBJAGCQSSuCIIBJAACARQBgkEcrgiCARwBgkEkrgiCASQBgkEorAJBHK4FAgEoAAJBMK2CARwBggEwAgwCQSiuCIIBKAGCQTCuBQIBMAACQTiuBQIBOAACQTyuCIIBPAGCQTyuBQIBPAACQTiuBQIBOAACQTCuBQIBMAACQSiuBQIBKAACQSSsAkEwrhSCATAAAgEkAYJBKK4FAgEoAAJBMK4FAgEwAAJBOK4FAgE4AAJBKK4FAgEoAAJBRK4NggFEAYJBOK4FAgE4AAJBMK4IggEwAYJBRK4IggFEAYJBMKwCQSSuCIIBJAACATABgkEorgUCASgAAkEcrgUCARwAAkEcrgiCARwBgkEkrgUCASQAAkEorgUCASgAAkEUrhSCARQCCIJBFK4FAgEUAAJBHK4IggEcAYJBJKwCQQyuCIIBDAACASQBgkEorAJBHK4FAgEoAAJBMK2CARwBggEwAAJBFK4IggEUAYJBKKwCQQiuCIIBCAACASgBgkEwrgUCATAAAkE4rgUCATgAAkE8rgiCATwBgkE8rgUCATwAAkE4rgUCATgAAkEwrgUCATAAAkEorgUCASgAAkEorh0CASgCHQJBOK4FAgE4AAJBPK4FAgE8AAJBRK4IggFEAYJBRK4IggFEAYJBRK4IggFEAYJBRK4IggFEAYJBRK4FAgFEAAJBTK4FAgFMAAJBRK4FAgFEAAJBPK4FAgE8AAJBOK4IggE4AYJBOK4IggE4AYJBOK4IggE4AYJBOK4IggE4AYJBOK4FAgE4AAJBPK4FAgE8AAJBOK4FAgE4AAJBMK4FAgEwAAJBKK4IggEoAYJBKKwCQRyuCIIBHAACASgBgkEorgUCASgAAkEkrgUCASQAAkEcrgiCARwBgkEcrgiCARwBgkEkrgUCASQAAkEorgUCASgAAkEwrgiCATABgkEwrgUCATAAAkE4rgUCATgAAkEwrgUCATAAAkE4rgUCATgAAkEkrAJBMK4UggEwAAIBJAGCQTiuBQIBOAACQTyuBQIBPAACQUSuCIIBRAGCQUSuCIIBRAGCQUSuCIIBRAGCQUSuCIIBRAGCQUSuBQIBRAACQUyuBQIBTAACQUSuBQIBRAACQTyuBQIBPAACQTiuCIIBOAGCQTiuCIIBOAGCQTiuCIIBOAGCQTiuBQIBOAACQTyuBQIBPAACQTiuBQIBOAACQTCuBQIBMAACQSiuBQIBKAACQSSuBQIBJAACQRyuCIIBHAGCQRyuBQIBHAACQSSuBQIBJAACQSisAkEcrgUCASgAAkEwrYIBHAGCATAAAkEUrgiCARQBgkEorgiCASgBgkEwrgUCATAAAkE4rgUCATgAAkEwrg2CATABgkEwrgUCATAAAkEwrgUCATAAAkEorgUCASgAAkEorh0CASgCQQJBKK4FAgEoAAJBMK4FAgEwAAJBOK4FAgE4AAJBKK4FAgEoAAJBRK4NggFEAYJBOK4FAgE4AAJBMK4IggEwAYJBRK4IggFEAYJBMKwCQSSuCIIBJAACATABgkEorgUCASgAAkEcrgUCARwAAkE4rgwCQRytggE4AYJBKK2CARwBggEoAAJBJK4UggEkAYJBJK4IggEkAYJBHK4IggEcAYJBJK4IggEkAYJBKKwCQRyuBQIBKAACQTCtggEcAYIBMAACQRSuCIIBFAGCQSiuCIIBKAGCQTCuBQIBMAACQTiuBQIBOAACQTyuCIIBPAGCQTyuBQIBPAACQTiuBQIBOAACQTCuBQIBMAACQSiuBQIBKAACQSSsAkEwrhSCATAAAgEkAYJBKK4FAgEoAAJBMK4FAgEwAAJBOK4FAgE4AAJBKK4FAgEoAAJBRK4NggFEAYJBOK4FAgE4AAJBMK4IggEwAYJBRK4IggFEAYJBMKwCQSSuCIIBJAACATABgkEorgUCASgAAkEcrgUCARwAAkEcrgiCARwBgkEkrgUCASQAAkEorgUCASgAAkEUrgwCQQiuCIIBFAIIgkEUrYIBCAGCARQAAkEcrgiCARwBgkEkrgiCASQBgkEorAJBHK4FAgEoAAJBMK2CARwBggEwAAJBFK4IggEUAYJBKK4IggEoAYJBMK4FAgEwAAJBOK4FAgE4AAJBPK4IggE8AYJBPK4FAgE8AAJBOK4FAgE4AAJBMK4FAgEwAAJBKK4FAgEoAAJBKK4dAgEoAh0CQTiuBQIBOAACQTyuBQIBPAACQUSuCIIBRAGCQUSuCIIBRAGCQUSuCIIBRAGCQUSuCIIBRAGCQUSuBQIBRAACQUyuBQIBTAACQUSuBQIBRAACQTyuBQIBPAACQTiuCIIBOAGCQTiuCIIBOAGCQTiuCIIBOAGCQTiuCIIBOAGCQTiuBQIBOAACQTyuBQIBPAACQTiuBQIBOAACQTCuBQIBMAACQSiuCIIBKAGCQSisAkEcrgiCARwAAgEoAYJBKK4FAgEoAAJBJK4FAgEkAAJBHK4IggEcAYJBHK4IggEcAYJBJK4FAgEkAAJBKK4FAgEoAAJBMK4IggEwAYJBMK4FAgEwAAJBOK4FAgE4AAJBMK4FAgEwAAJBOK4FAgE4AAJBJKwCQTCuFIIBMAACASQBgkE4rAJBJK4FAgE4AAJBPK2CASQBggE8AAJBRK4IggFEAYJBRK4IggFEAYJBRK4IggFEAYJBRK4IggFEAYJBRK4FAgFEAAJBTK4FAgFMAAJBRK4FAgFEAAJBPK4FAgE8AAJBOK4IggE4AYJBOK4IggE4AYJBOK4IggE4AYJBOK4FAgE4AAJBPK4FAgE8AAJBOK4FAgE4AAJBMK4FAgEwAAJBKK4FAgEoAAJBJK4FAgEkAAJBHK4IggEcAYJBHK4FAgEcAAJBJK4FAgEkAAJBKKwCQRyuBQIBKAACQTCtggEcAYIBMAACQRSuCIIBFAGCQSiuCIIBKAGCQTCsAkEUrgUCATAAAkE4rYIBFAGCATgAAkEwrg2CATABgkEwrgUCATAAAkEwrgUCATAAAkEorgUCASgAAkEorh0CASgCiQJBKK4FAgEoAAJBMK4FAgEwAAJBOK4FAgE4AAJBKK4FAgEoAAJBRK4NggFEAYJBOK4FAgE4AAJBMK4IggEwAYJBRK4IggFEAYJBMK4IggEwAYJBKK4FAgEoAAJBHK4FAgEcAAJBOK4NggE4AYJBKK4FAgEoAAJBJK4UggEkAYJBJK4IggEkAYJBHK4IggEcAYJBJK4IggEkAYJBKK4FAgEoAAJBMK4FAgEwAAJBFK4IggEUAYJBKK4IggEoAYJBMK4FAgEwAAJBOK4FAgE4AAJBPKwCQRyuCIIBPAGCQTyuBQIBPAACQTiuBQIBOAACQTCuBQIBMAACARwAAkEorgUCASgAAkEwrhSCATABgkEorgUCASgAAkEwrgUCATAAAkE4rgUCATgAAkEorgUCASgAAkFErg2CAUQBgkE4rgUCATgAAkEwrAJBJK4IggEwAYJBRK4IggFEAYJBMK4FAgEkAYIBMAGCQSiuBQIBKAACQRyuBQIBHAACQRyuCIIBHAGCQSSuBQIBJAACQSiuBQIBKAACQRSuFIIBFAGCQRSuCIIBFAGCQRyuCIIBHAGCQSSuCIIBJAGCQSiuBQIBKAACQTCuBQIBMAACQRSuCIIBFAGCQSiuCIIBKAGCQTCuBQIBMAACQTiuBQIBOAACQTysAkEcrgiCATwBgkE8rgUCATwAAkE4rgUCATgAAkEwrgUCATAAAgEcAAJBKK4FAgEoAAJBCKwCQSiuHQIBKAACAQgCHQJBOK4FAgE4AAJBPK4FAgE8AAJBRKwCQTiuCIIBRAGCQUSuCIIBRAGCQUSuBQIBOAGCAUQBgkFErAJBJK4IggFEAYJBRK4FAgFEAAJBTK4FAgFMAAJBRK4FAgFEAAIBJAACQTyuBQIBPAACQTisAkEorgiCATgBgkE4rgiCATgBgkE4rgUCASgBggE4AYJBOKwCQRSuCIIBOAGCQTiuBQIBOAACQTyuBQIBPAACQTiuBQIBOAACARQAAkEwrgUCATAAAkEorgiCASgBgkEorgiCASgBgkEorgUCASgAAkEkrgUCASQAAkEcrAJBDK4IggEcAYJBHK4IggEcAYJBJK4FAgEkAAIBDAACQSiuBQIBKAACQTCsAkEMrgiCATABgkEwrgUCATAAAkE4rgUCATgAAkEwrgUCATAAAgEMAAJBOK4FAgE4AAJBJKwCQTCuFIIBMAACASQBgkE4rgUCATgAAkE8rgUCATwAAkFErAJBOK4IggFEAYJBRK4IggFEAYJBRK4FAgE4AYIBRAGCQUSsAkEkrgiCAUQBgkFErgUCAUQAAkFMrgUCAUwAAkFErgUCAUQAAgEkAAJBPK4FAgE8AAJBOKwCQSiuCIIBOAGCQTiuCIIBOAGCQTiuBQIBKAGCATgBgkE4rAJBFK4FAgE4AAJBPK4FAgE8AAJBOK4FAgE4AAJBMK4FAgEwAAJBKK4FAgEoAAIBFAACQSSuBQIBJAACQRysAkEMrgiCARwBgkEcrgUCARwAAkEkrgUCASQAAkEorgUCASgAAgEMAAJBMK4FAgEwAAJBFKwCQQCuCIIBFAGCQSiuCIIBKAGCQTCuBQIBMAACAQAAAkE4rgUCATgAAkEwrAJBHK4NggEwAYJBMK4FAgEwAAJBMK4FAgEwAAIBHAACQSiuBQIBKAACQSiuHQIBKAJBAkEorgUCASgAAkEwrgUCATAAAkE4rgUCATgAAkEorgUCASgAAkFErg2CAUQBgkE4rgUCATgAAkEwrAJBJK4IggEwAYJBRK4IggFEAYJBMK4FAgEkAYIBMAGCQSiuBQIBKAACQRyuBQIBHAACQTiuDYIBOAGCQSiuBQIBKAACQSSuFIIBJAGCQSSuCIIBJAGCQRyuCIIBHAGCQSSuCIIBJAGCQSiuBQIBKAACQTCuBQIBMAACQRSuCIIBFAGCQSiuCIIBKAGCQTCuBQIBMAACQTiuBQIBOAACQTysAkEcrgiCATwBgkE8rgUCATwAAkE4rgUCATgAAkEwrgUCATAAAgEcAAJBKK4FAgEoAAJBMK4UggEwAYJBKK4FAgEoAAJBMK4FAgEwAAJBOK4FAgE4AAJBKK4FAgEoAAJBRK4NggFEAYJBOK4FAgE4AAJBMKwCQSSuCIIBMAGCQUSuCIIBRAGCQTCuBQIBJAGCATABgkEorgUCASgAAkEcrgUCARwAAkEcrgiCARwBgkEkrgUCASQAAkEorgUCASgAAkEUrhSCARQBgkEUrgiCARQBgkEcrgiCARwBgkEkrgiCASQBgkEorgUCASgAAkEwrgUCATAAAkEUrgiCARQBgkEorgiCASgBgkEwrgUCATAAAkE4rgUCATgAAkE8rAJBHK4IggE8AYJBPK4FAgE8AAJBOK4FAgE4AAJBMK4FAgEwAAIBHAACQSiuBQIBKAACQQisAkEorhgCQQiuBQIBKAACAQgBggEIAlWCQSiuCIIBKAGCQTisAkEorgUCATgAAkE8rYIBKAGCATwAAkFErAJBOK4IggFEAYJBRK4IggFEAYJBRK4FAgE4AYIBRAGCQUSsAkEkrgiCAUQBgkFErgUCAUQAAkFMrgUCAUwAAkFErAJBJK4FAgFEAAIBJAACQTytggEkAYIBPAACQTisAkEorgiCATgBgkE4rgiCATgBgkE4rAJBHK4FAgEoAYIBHAACATgBgkE4rAJBFK4IggE4AYJBOK4FAgE4AAJBPK4FAgE8AAJBOKwCQRSuBQIBOAACARQAAkEwrYIBFAGCATAAAkEorgiCASgBgkEorAJBHK4IggEcAAIBKAGCQSiuBQIBKAACQSSuBQIBJAACQRysAkEMrgiCARwBgkEcrgiCARwBgkEkrgUCASQAAgEMAAJBKK4FAgEoAAJBMK4IggEwAYJBMK4FAgEwAAJBOK4FAgE4AAJBMK4FAgEwAAJBOK4FAgE4AAJBJKwCQTCuFIIBMAACASQBgkE4rAJBJK4FAgE4AAJBPK2CASQBggE8AAJBRKwCQTiuCIIBRAGCQUSuCIIBRAGCQUSuBQIBOAGCAUQBgkFErAJBJK4IggFEAYJBRK4FAgFEAAJBTK4FAgFMAAJBRKwCQSSuBQIBRAACASQAAkE8rYIBJAGCATwAAkE4rAJBKK4IggE4AYJBOK4IggE4AYJBOKwCQSiuBQIBKAGCASgAAgE4AYJBOKwCQRSuBQIBOAACQTyuBQIBPAACQTiuBQIBOAACQTCuBQIBMAACQSisAkEUrgUCASgAAgEUAAJBJK2CARQBggEkAAJBHKwCQQyuCIIBHAGCQRysAkEMrgUCARwAAkEkrYIBDAGCASQAAkEorAJBHK4FAgEoAAIBDAACQTCtggEcAYIBMAACQRSuCIIBFAGCQSisAkEIrgiCAQgAAgEoAYJBMKwCQRSuBQIBMAACQTitggEUAYIBOAACQTCsAkEcrg2CATABgkEwrgUCATAAAkEwrgUCATAAAgEcAAJBKK4FAgEoAAJBKK4dAgEoAjUCQPiuCIIA+AGCQQiuCIIBCAGCQRSuCIIBFAGCQSiuCIIBKAGCQTisAkEorgiCASgAAgE4AYJBFKwCQTisAkDIrAJA5K4dAgDkAAIAyAACATgAAgEUAAP8vAE1UcmsAABDiAP8DDENsZWFuIEd1aXRhcgDBGwCRMgKCIIEyAGCROQIAkT4CgiCBPgAAgTkAYJFCAoIggUIAYJEyAoIggTIAYJE5AgCRPgKCIIE+AACBOQBgkUICgiCBQgBgkTICgiCBMgBgkTkCAJE+AoIggT4AAIE5AGCRQgKCIIFCAGCRMgKCIIEyAGCROQIAkT4CgiCBPgAAgTkAYJFCAoIggUIAYJEyAoIggTIAYJE5AgCRPgKCIIE+AACBOQBgkUICgiCBQgBgkTkCAJE9AoIggT0AAIE5AGCRQAKCIIFAAINgkTsCgiCBOwBgkT4CgiCBPgCDYJE2AoIggTYAYJE9AoUggT0AYJE3AoIggTcAYJE+AgCRQwKCIIFDAACBPgCDYJFFAgCRNgKCIIE2AACBRQBgkT4CAJFCAoIggUIAAIE+AGCRRQKCIIFFAGCRNAKCIIE0AGCROwIAkUACgiCBQAAAgTsAYJFDAoIggUMAYJE5AoIggTkAYJFAAoUggUAAYJEyAoIggTIAYJE5AgCRPgKCIIE+AACBOQBgkUICgiCBQgBgkTkCAJE9AoIggT0AAIE5AGCRQAKCIIFAAINgkTsCgiCBOwBgkT4CgiCBPgBgkUICgiCBQgBgkTYCgiCBNgBgkT0CAJFCAoUggUIAAIE9AGCRNwKCIIE3AGCRPgKCIIE+AINgkTYCgiCBNgBgkT4CgiCBPgBgkUUCgiCBRQBgkTQCgiCBNABgkTsCAJFAAoIggUAAAIE7AGCROQKCIIE5AGCRMgKCIIEyAGCROQIAkT4CgiCBPgAAgTkAYJFCAoIggUIAYJEyAoIggTIAYJE5AgCRPgKFIIE+AACBOQBgkTICgiCBMgBgkTkCAJE+AoUggT4AAIE5AGCROQIAkT0CgiCBPQAAgTkAYJFAAoIggUAAYJFJAoIggUkAYJE7AoIggTsAYJE+AoIggT4AYJFHAoIggUcAYJE2AoIggTYAYJE9AgCRQgKCIIFCAACBPQBgkUUCgiCBRQBgkTsCgiCBOwBgkUICgiCBQgBgkT4CgiCBPgBgkTcCgiCBNwBgkT4CgiCBPgBgkUMCgiCBQwBgkTQCgiCBNABgkTsCAJFAAoIggUAAAIE7AGCRQwKCIIFDAGCROQKCIIE5AGCRQAIAkUUCgiCBRQAAgUAAYJFJAoIggUkAYJEyAoIggTIAYJE5AgCRPgKCIIE+AACBOQBgkUICgiCBQgBgkTkCAJE9AoIggT0AAIE5AGCRQAKCIIFAAGCRSQKCIIFJAGCROwKCIIE7AGCRQgKCIIFCAGCRSgKCIIFKAGCRNgKCIIE2AGCRPQKCIIE9AGCRRQKCIIFFAGCRNwKCIIE3AGCRPgIAkUMCgiCBQwAAgT4Ag2CRNgKCIIE2AGCRPgIAkUICgiCBQgAAgT4AYJFFAoIggUUAYJE3AoIggTcAYJE7AgCRQAKCIIFAAACBOwBgkTkCgiCBOQBgkTICgiCBMgBgkT4CAJFCAoUggUIAAIE+AGCRMgKCIIEyAGCROQIAkT4CgiCBPgAAgTkAYJFCAoIggUIAYJEyAoIggTIAYJE5AgCRPgKCIIE+AACBOQBgkUICgiCBQgBgkTICgiCBMgBgkTkCAJE+AoIggT4AAIE5AGCRQgKCIIFCAGCROQIAkT0CgiCBPQAAgTkAYJFAAoIggUAAg2CROwKCIIE7AGCRPgKCIIE+AINgkTYCgiCBNgBgkT0CAJFFAoUggUUAAIE9AGCRNwKCIIE3AGCRPgIAkUMCgiCBQwAAgT4Ag2CRNgKCIIE2AGCRPgIAkUICgiCBQgAAgT4AYJFFAoIggUUAYJE0AoIggTQAYJE7AgCRQAKCIIFAAACBOwBgkUMCgiCBQwBgkTkCgiCBOQBgkUAChSCBQABgkTICgiCBMgBgkTkCAJE+AoIggT4AAIE5AGCRQgKCIIFCAGCROQIAkT0CgiCBPQAAgTkAYJFAAoIggUAAg2CROwKCIIE7AGCRPgKCIIE+AGCRQgKCIIFCAGCRNgKCIIE2AGCRPQKFIIE9AGCRNwKCIIE3AGCRPgIAkUMCgiCBQwAAgT4Ag2CRNgKCIIE2AGCRPgIAkUICgiCBQgAAgT4AYJFFAoIggUUAYJE0AoIggTQAYJE7AgCRQAKCIIFAAACBOwBgkTkCgiCBOQBgkTICgiCBMgBgkTkCAJE+AoIggT4AAIE5AGCRQgKCIIFCAGCRMgKCIIEyAGCROQIAkT4ChSCBPgAAgTkAYJEyAoIggTIAYJE5AgCRPgKFIIE+AACBOQBgkTkCAJE9AoIggT0AAIE5AGCRQAKCIIFAAGCRSQKCIIFJAGCROwKCIIE7AGCRPgKCIIE+AGCRRwKCIIFHAGCRNgKCIIE2AGCRPQIAkUICgiCBQgAAgT0AYJFFAoIggUUAYJE7AoIggTsAYJFCAoIggUIAYJE+AoIggT4AYJE3AoIggTcAYJE+AoIggT4AYJFDAoIggUMAYJE0AoIggTQAYJE7AgCRQAKCIIFAAACBOwBgkUMCgiCBQwBgkTkCgiCBOQBgkUACAJFFAoIggUUAAIFAAINgkTICgiCBMgBgkTkCAJE+AoIggT4AAIE5AGCRQgKCIIFCAGCROQIAkT0CgiCBPQAAgTkAYJFAAoIggUAAYJFJAoIggUkAYJE7AoIggTsAYJFC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k0IrgiCDQgBgkzkrAJM9K4Iggz0AAIM5AGCTQCuCIINAAINgkzsrgiCDOwBgkz4rgiCDPgCDYJM2K4IggzYAYJM9KwCTRSuFIINFAACDPQBgkzcrgiCDNwBgkz4rAJNDK4Igg0MAAIM+AINgkzYrgiCDNgBgkz4rAJNCK4Igg0IAAIM+AGCTRSuCIINFAGCTNCuCIIM0AGCTOysAk0ArgiCDQAAAgzsAYJNDK4Igg0MAYJM5K4IggzkAYJNAK4Ugg0AAYJMyK4IggzIAYJM5KwCTPiuCIIM+AACDOQBgk0IrgiCDQgBgkzkrAJM9K4Iggz0AAIM5AGCTQCuCIINAAINgkzsrgiCDOwBgkz4rgiCDPgBgk0IrgiCDQgBgkzYrgiCDNgBgkz0rhSCDPQBgkzcrgiCDNwBgkz4rAJNDK4Igg0MAAIM+AINgkzYrgiCDNgBgkz4rAJNCK4Igg0IAAIM+AGCTRSuCIINFAGCTNCuCIIM0AGCTOysAk0ArgiCDQAAAgzsAYJM5K4IggzkAYJMyK4IggzIAYJM5KwCTPiuCIIM+AACDOQBgk0IrgiCDQgBgkzIrgiCDMgBgkzkrAJM+K4Uggz4AAIM5AGCTMiuCIIMyAGCTOSsAkz4rhSCDPgAAgzkAYJM5KwCTPSuCIIM9AACDOQBgk0ArgiCDQABgk0krgiCDSQBgkzsrgiCDOwBgkz4rgiCDPgBgk0crgiCDRwBgkzYrgiCDNgBgkz0rAJNCK4Igg0IAAIM9AGCTRSuCIINFAGCTOyuCIIM7AGCTQiuCIINCAGCTPiuCIIM+AGCTNyuCIIM3AGCTPiuCIIM+AGCTQyuCIINDAGCTNCuCIIM0AGCTOysAk0ArgiCDQAAAgzsAYJNDK4Igg0MAYJM5K4IggzkAYJNAKwCTRSuCIINFAACDQACDYJMyK4IggzIAYJM5KwCTPiuCIIM+AACDOQBgk0IrgiCDQgBgkzkrAJM9K4Iggz0AAIM5AGCTQCuCIINAAGCTSSuCIINJAGCTOyuCIIM7AGCTQiuCIINCAGCTSiuCIINKAGCTNiuCIIM2AGCTPSuCIIM9AGCTRSuCIINFAGCTNyuCIIM3AGCTPisAk0MrgiCDQwAAgz4Ag2CTNiuCIIM2AGCTPisAk0IrgiCDQgAAgz4Ag2CTNyuCIIM3AGCTOysAk0ArgiCDQAAA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';
+let audioReady = false;
+let audioSynth = null;
+let audioPart = null;
+
+async function initAudio() {
+    if (audioReady) return;
+    try {
+        await Tone.start();
+        const raw = atob(MIDI_B64);
+        const ab = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) ab[i] = raw.charCodeAt(i);
+        const { notes, duration, bpm } = parseMidi(ab.buffer);
+
+        audioSynth = new Tone.PolySynth(Tone.Synth, {
+            maxPolyphony: 24,
+            voice: Tone.Synth,
+            options: { oscillator: { type: 'triangle' }, envelope: { attack: 0.02, decay: 0.3, sustain: 0.4, release: 1.2 } }
+        }).toDestination();
+        audioSynth.volume.value = -14;
+
+        const evts = notes.map(n => [n.time, { name: midiNoteName(n.note), duration: n.duration, vel: n.vel }]);
+        audioPart = new Tone.Part((time, note) => {
+            audioSynth.triggerAttackRelease(note.name, note.duration, time, note.vel);
+        }, evts);
+        audioPart.start(0);
+
+        Tone.Transport.bpm.value = bpm;
+        Tone.Transport.loop = true;
+        Tone.Transport.loopStart = 0;
+        Tone.Transport.loopEnd = duration;
+        Tone.Transport.start();
+        audioReady = true;
+    } catch (e) { console.warn('MIDI init failed:', e); }
+}
+
+function setAudioPause(p) {
+    if (!audioReady) return;
+    if (p) Tone.Transport.pause();
+    else Tone.Transport.start();
+}
+
+const CHUNK_SIZE = 120;
+const CHUNK_SEG_NEAR = 48;
+const CHUNK_SEG_FAR = 20;
+const LOD_INNER = 3;
+const MAX_CHUNK_OPS = 2;
+const MAX_CLOUDS = 120;
+const MAX_TREES_PER_CHUNK = 120;
+
+const params = {
+    noiseScale: 0.002598,
+    elevation: 50,
+    waterLevel: -18.5,
+    snowLine: 33,
+    gravity: 10,
+    fogDensity: 0.002,
+    fogColor: '#7ec8e3',
+    cloudCount: 40,
+    timeOfDay: 10.0,
+    renderDist: 6,
+};
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(params.fogColor);
+scene.fog = new THREE.FogExp2(params.fogColor, params.fogDensity);
+
+const camera = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 0.5, 4000);
+const clock = new THREE.Clock();
+
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.45);
+scene.add(ambientLight);
+const sunLight = new THREE.DirectionalLight(0xfff4e0, 1.3);
+sunLight.position.set(150, 250, 100);
+scene.add(sunLight);
+const hemiLight = new THREE.HemisphereLight(0x87ceeb, 0x4a7c3f, 0.3);
+scene.add(hemiLight);
+
+let noise2D = createNoise2D();
+let treeNoise2D = createNoise2D();
+
+function getTerrainHeight(x, z) {
+    const s = params.noiseScale;
+    const e = params.elevation;
+    return noise2D(x * s, z * s) * e
+         + noise2D(x * s * 2.13, z * s * 2.13) * e * 0.45
+         + noise2D(x * s * 4.27, z * s * 4.27) * e * 0.2
+         + noise2D(x * s * 8.1, z * s * 8.1) * e * 0.08;
+}
+
+const _bc = new THREE.Color();
+function getBiomeColor(height, x, z) {
+    const dx = getTerrainHeight(x + 2, z) - getTerrainHeight(x - 2, z);
+    const dz = getTerrainHeight(x, z + 2) - getTerrainHeight(x, z - 2);
+    const slope = Math.abs(dx) + Math.abs(dz);
+    const v = noise2D(x * 0.025, z * 0.025) * 0.04;
+    const wl = params.waterLevel;
+    const sl = params.snowLine;
+
+    if (height < wl - 3) return _bc.setRGB(0.06 + v, 0.18 + v, 0.38 + v);
+    if (height < wl + 0.5) return _bc.setRGB(0.12 + v, 0.35 + v, 0.58 + v);
+    if (height < wl + 4 && slope < 1.5) return _bc.setRGB(0.72 + v, 0.62 + v, 0.4 + v);
+    if (slope > 4) return _bc.setRGB(0.42 + v, 0.4 + v, 0.37 + v);
+    if (height > sl) return _bc.setRGB(0.9 + v, 0.91 + v, 0.94 + v);
+    if (height > sl * 0.72) return _bc.setRGB(0.48 + v, 0.46 + v, 0.42 + v);
+    if (height > sl * 0.4) return _bc.setRGB(0.13 + v, 0.37 + v, 0.14 + v);
+    return _bc.setRGB(0.28 + v, 0.58 + v, 0.22 + v);
+}
+
+const terrainMat = new THREE.MeshStandardMaterial({
+    vertexColors: true,
+    flatShading: true,
+    roughness: 0.88,
+    metalness: 0.0,
+});
+
+const birdGroup = new THREE.Group();
+const birdParts = {};
+(function buildBird() {
+    const bodyMat = new THREE.MeshStandardMaterial({ color: 0x4a5568, roughness: 0.7 });
+    const darkMat = new THREE.MeshStandardMaterial({ color: 0x2d3748, roughness: 0.6 });
+    const wingMat = new THREE.MeshStandardMaterial({ color: 0x374151, side: THREE.DoubleSide, roughness: 0.65 });
+    const wingUnder = new THREE.MeshStandardMaterial({ color: 0x9ca3af, side: THREE.DoubleSide, roughness: 0.7 });
+    const beakMat = new THREE.MeshStandardMaterial({ color: 0xed8936, roughness: 0.4 });
+    const eyeMat = new THREE.MeshStandardMaterial({ color: 0x1a1a1a });
+
+    const bodyG = new THREE.CapsuleGeometry(0.55, 2.2, 10, 14);
+    const body = new THREE.Mesh(bodyG, bodyMat);
+    body.rotation.x = Math.PI / 2;
+    birdGroup.add(body);
+
+    const headG = new THREE.SphereGeometry(0.38, 14, 10);
+    const head = new THREE.Mesh(headG, darkMat);
+    head.position.set(0, 0.18, 1.45);
+    birdGroup.add(head);
+
+    const beakG = new THREE.ConeGeometry(0.1, 0.55, 8);
+    const beak = new THREE.Mesh(beakG, beakMat);
+    beak.rotation.x = -Math.PI / 2;
+    beak.position.set(0, 0.08, 1.85);
+    birdGroup.add(beak);
+
+    const eyeG = new THREE.SphereGeometry(0.055, 8, 6);
+    [-1, 1].forEach(side => {
+        const eye = new THREE.Mesh(eyeG, eyeMat);
+        eye.position.set(side * 0.24, 0.3, 1.35);
+        birdGroup.add(eye);
+    });
+
+    function makeWing(len, rootW, tipW, mat) {
+        const sh = new THREE.Shape();
+        sh.moveTo(0, -rootW / 2);
+        sh.lineTo(0, rootW / 2);
+        sh.quadraticCurveTo(-len * 0.55, tipW * 0.65, -len, tipW / 2);
+        sh.lineTo(-len, -tipW / 2);
+        sh.quadraticCurveTo(-len * 0.55, -tipW * 0.65, 0, -rootW / 2);
+        const g = new THREE.ShapeGeometry(sh);
+        g.rotateX(-Math.PI / 2);
+        return new THREE.Mesh(g, mat);
+    }
+
+    birdParts.leftWingPivot = new THREE.Group();
+    birdParts.leftWingPivot.position.set(-0.55, 0.12, -0.1);
+    birdGroup.add(birdParts.leftWingPivot);
+    birdParts.leftWingPivot.add(makeWing(1.6, 0.5, 0.75, wingMat));
+    const luP = new THREE.Group();
+    luP.position.set(-1.6, 0, 0.05);
+    birdParts.leftWingPivot.add(luP);
+    luP.add(makeWing(1.4, 0.75, 0.25, wingMat));
+    birdParts.leftOuterPivot = luP;
+
+    const lUnder = makeWing(1.6, 0.48, 0.7, wingUnder);
+    lUnder.position.y = -0.02;
+    birdParts.leftWingPivot.add(lUnder);
+
+    birdParts.rightWingPivot = new THREE.Group();
+    birdParts.rightWingPivot.position.set(0.55, 0.12, -0.1);
+    birdGroup.add(birdParts.rightWingPivot);
+    const rw = makeWing(1.6, 0.5, 0.75, wingMat);
+    rw.scale.x = -1;
+    birdParts.rightWingPivot.add(rw);
+    const ruP = new THREE.Group();
+    ruP.position.set(1.6, 0, 0.05);
+    birdParts.rightWingPivot.add(ruP);
+    const rou = makeWing(1.4, 0.75, 0.25, wingMat);
+    rou.scale.x = -1;
+    ruP.add(rou);
+    birdParts.rightOuterPivot = ruP;
+
+    const rUnder = makeWing(1.6, 0.48, 0.7, wingUnder);
+    rUnder.scale.x = -1;
+    rUnder.position.y = -0.02;
+    birdParts.rightWingPivot.add(rUnder);
+
+    const tailSh = new THREE.Shape();
+    tailSh.moveTo(-0.35, 0);
+    tailSh.lineTo(0.35, 0);
+    tailSh.lineTo(0.5, -1.1);
+    tailSh.lineTo(-0.5, -1.1);
+    tailSh.closePath();
+    const tailG = new THREE.ShapeGeometry(tailSh);
+    tailG.rotateX(-Math.PI / 2);
+    birdParts.tail = new THREE.Mesh(tailG, wingMat);
+    birdParts.tail.position.set(0, 0.06, -1.5);
+    birdGroup.add(birdParts.tail);
+
+    scene.add(birdGroup);
+})();
+
+const phys = {
+    pos: new THREE.Vector3(0, 80, 0),
+    vel: new THREE.Vector3(0, 0, 30),
+    yaw: 0,
+    pitch: 0,
+    roll: 0,
+    speed: 30,
+    vY: 0,
+    flapCD: 0,
+    flapPhase: 0,
+    flapAmp: 0.08,
+};
+
+const wingAnim = { phase: 0, amplitude: 0.08 };
+
+const camState = {
+    offset: new THREE.Vector3(0, 8, -20),
+    lookAhead: 12,
+    currentPos: new THREE.Vector3(),
+    currentLook: new THREE.Vector3(),
+    baseFOV: 65,
+    maxFOV: 82,
+};
+
+const keys = {};
+let paused = true;
+let started = false;
+const pausedEl = document.getElementById('paused');
+const startModal = document.getElementById('startModal');
+window.addEventListener('keydown', e => {
+    if (!started) { started = true; startModal.style.display = 'none'; paused = false; pausedEl.style.display = 'none'; initAudio(); e.preventDefault(); return; }
+    if (!audioReady) initAudio();
+    if (e.code === 'Space') { paused = !paused; pausedEl.style.display = paused ? 'block' : 'none'; setAudioPause(paused); e.preventDefault(); return; }
+    keys[e.code] = true; e.preventDefault();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function updatePhysics(dt) {
+    let accel = 0, pitchTgt = 0, yawR = 0, rollTgt = 0;
+
+    if (keys['KeyW']) { accel = 40; pitchTgt = -0.12; }
+    if (keys['KeyS']) { accel = -30; pitchTgt = 0.18; }
+    if (keys['KeyA']) { yawR = 1.4; rollTgt = -0.55; }
+    if (keys['KeyD']) { yawR = -1.4; rollTgt = 0.55; }
+    if (keys['KeyE'] && phys.flapCD <= 0) {
+        phys.vY = 28;
+        phys.flapCD = 0.45;
+        wingAnim.phase = phys.flapPhase;
+    }
+    if (keys['KeyQ']) { pitchTgt = -0.45; phys.vY -= 60 * dt; }
+
+    phys.vY -= params.gravity * dt;
+    phys.vY = THREE.MathUtils.clamp(phys.vY, -55, 40);
+
+    phys.speed += accel * dt;
+    phys.speed = THREE.MathUtils.clamp(phys.speed, 5, 85);
+    phys.speed *= Math.pow(0.975, dt * 60);
+
+    phys.yaw += yawR * dt * Math.min(phys.speed / 30, 1.5);
+    phys.pitch = THREE.MathUtils.lerp(phys.pitch, pitchTgt, 2.8 * dt);
+    phys.roll = THREE.MathUtils.lerp(phys.roll, rollTgt, 3.5 * dt);
+
+    const fwd = new THREE.Vector3(
+        Math.sin(phys.yaw) * Math.cos(phys.pitch),
+        Math.sin(phys.pitch),
+        Math.cos(phys.yaw) * Math.cos(phys.pitch)
+    );
+
+    phys.vel.copy(fwd).multiplyScalar(phys.speed);
+    phys.vel.y += phys.vY;
+    phys.pos.addScaledVector(phys.vel, dt);
+
+    const gH = getTerrainHeight(phys.pos.x, phys.pos.z);
+    const minY = Math.max(gH + 2.5, params.waterLevel + 1.5);
+    if (phys.pos.y < minY) {
+        phys.pos.y = minY;
+        phys.vY = Math.abs(phys.vY) * 0.2;
+        phys.speed = Math.max(phys.speed, 18);
+    }
+
+    phys.flapCD -= dt;
+}
+
+function updateBirdModel(dt) {
+    birdGroup.position.copy(phys.pos);
+    const euler = new THREE.Euler(phys.pitch, phys.yaw, phys.roll, 'YXZ');
+    const tgtQ = new THREE.Quaternion().setFromEuler(euler);
+    birdGroup.quaternion.slerp(tgtQ, 6 * dt);
+
+    const flapping = (keys['KeyE'] && phys.flapCD > -0.1 && phys.flapCD < 0.35);
+    if (flapping) {
+        phys.flapPhase += 14 * dt;
+        wingAnim.amplitude = THREE.MathUtils.lerp(wingAnim.amplitude, 0.65, 10 * dt);
+    } else {
+        wingAnim.amplitude = THREE.MathUtils.lerp(wingAnim.amplitude, 0.06, 2.5 * dt);
+    }
+
+    const fa = Math.sin(phys.flapPhase) * wingAnim.amplitude;
+    birdParts.leftWingPivot.rotation.z = -fa - 0.07;
+    birdParts.leftOuterPivot.rotation.z = -fa * 0.45;
+    birdParts.rightWingPivot.rotation.z = fa + 0.07;
+    birdParts.rightOuterPivot.rotation.z = fa * 0.45;
+
+    const pitchKick = phys.pitch * 0.3;
+    birdParts.tail.rotation.x = THREE.MathUtils.lerp(birdParts.tail.rotation.x, -pitchKick - fa * 0.2, 5 * dt);
+}
+
+function updateCamera(dt) {
+    const fwd = new THREE.Vector3(
+        Math.sin(phys.yaw) * Math.cos(phys.pitch),
+        Math.sin(phys.pitch),
+        Math.cos(phys.yaw) * Math.cos(phys.pitch)
+    );
+
+    const behind = fwd.clone().multiplyScalar(-1);
+    const dist = 20;
+    const height = 9;
+    const tgtPos = phys.pos.clone()
+        .addScaledVector(behind, dist)
+        .add(new THREE.Vector3(0, height, 0));
+
+    const lookPt = phys.pos.clone().addScaledVector(fwd, camState.lookAhead);
+
+    const lerpF = 3.5 * dt;
+    camState.currentPos.lerp(tgtPos, lerpF);
+    camState.currentLook.lerp(lookPt, lerpF);
+
+    camera.position.copy(camState.currentPos);
+    camera.lookAt(camState.currentLook);
+
+    const speedRatio = phys.speed / 85;
+    camera.fov = THREE.MathUtils.lerp(camState.baseFOV, camState.maxFOV, speedRatio);
+    camera.updateProjectionMatrix();
+}
+
+const chunks = new Map();
+let chunkQueue = [];
+
+function genChunkKey(cx, cz) { return `${cx},${cz}`; }
+
+function createChunkMesh(cx, cz, segs) {
+    const geo = new THREE.PlaneGeometry(CHUNK_SIZE, CHUNK_SIZE, segs, segs);
+    geo.rotateX(-Math.PI / 2);
+    const pos = geo.attributes.position;
+    const cols = new Float32Array(pos.count * 3);
+    const hArr = new Float32Array(pos.count);
+
+    for (let i = 0; i < pos.count; i++) {
+        const wx = pos.getX(i) + cx * CHUNK_SIZE;
+        const wz = pos.getZ(i) + cz * CHUNK_SIZE;
+        const h = getTerrainHeight(wx, wz);
+        pos.setY(i, h);
+        hArr[i] = h;
+        const c = getBiomeColor(h, wx, wz);
+        cols[i * 3] = c.r;
+        cols[i * 3 + 1] = c.g;
+        cols[i * 3 + 2] = c.b;
+    }
+
+    geo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+    geo.computeVertexNormals();
+    const mesh = new THREE.Mesh(geo, terrainMat);
+    mesh.position.set(cx * CHUNK_SIZE, 0, cz * CHUNK_SIZE);
+    mesh.frustumCulled = true;
+    scene.add(mesh);
+    return { mesh, hArr, segs, cx, cz };
+}
+
+function createChunkTrees(cx, cz, segs) {
+    const positions = [];
+    const step = CHUNK_SIZE / 18;
+    const half = CHUNK_SIZE / 2;
+
+    for (let lx = -half + step; lx < half; lx += step) {
+        for (let lz = -half + step; lz < half; lz += step) {
+            const wx = lx + cx * CHUNK_SIZE;
+            const wz = lz + cz * CHUNK_SIZE;
+            const h = getTerrainHeight(wx, wz);
+            if (h < params.waterLevel + 5 || h > params.snowLine * 0.65) continue;
+
+            const dx = getTerrainHeight(wx + 1.5, wz) - getTerrainHeight(wx - 1.5, wz);
+            const dz = getTerrainHeight(wx, wz + 1.5) - getTerrainHeight(wx, wz - 1.5);
+            if (Math.abs(dx) + Math.abs(dz) > 3) continue;
+
+            const tn = treeNoise2D(wx * 0.08, wz * 0.08);
+            if (tn > 0.2 && positions.length < MAX_TREES_PER_CHUNK) {
+                positions.push({ x: wx, y: h, z: wz, s: 0.7 + (tn - 0.2) * 1.5 });
+            }
+        }
+    }
+
+    if (positions.length === 0) return null;
+
+    const group = new THREE.Group();
+    const count = positions.length;
+
+    const trunkG = new THREE.CylinderGeometry(0.15, 0.25, 2.2, 5);
+    const trunkM = new THREE.MeshStandardMaterial({ color: 0x5D4037, roughness: 0.9 });
+    const trunks = new THREE.InstancedMesh(trunkG, trunkM, count);
+
+    const canopyG = new THREE.ConeGeometry(1.6, 3.5, 6);
+    const canopyM = new THREE.MeshStandardMaterial({ color: 0x2E7D32, roughness: 0.85 });
+    const canopies = new THREE.InstancedMesh(canopyG, canopyM, count);
+
+    const dummy = new THREE.Object3D();
+    for (let i = 0; i < count; i++) {
+        const p = positions[i];
+        dummy.position.set(p.x, p.y + 1.1 * p.s, p.z);
+        dummy.scale.setScalar(p.s);
+        dummy.rotation.y = (p.x * 3.7 + p.z * 7.1) % (Math.PI * 2);
+        dummy.updateMatrix();
+        trunks.setMatrixAt(i, dummy.matrix);
+
+        dummy.position.y = p.y + 2.8 * p.s;
+        dummy.updateMatrix();
+        canopies.setMatrixAt(i, dummy.matrix);
+    }
+    trunks.instanceMatrix.needsUpdate = true;
+    canopies.instanceMatrix.needsUpdate = true;
+    trunks.frustumCulled = true;
+    canopies.frustumCulled = true;
+
+    group.add(trunks, canopies);
+    scene.add(group);
+    return group;
+}
+
+function disposeChunk(chunk) {
+    if (chunk.mesh) {
+        chunk.mesh.geometry.dispose();
+        scene.remove(chunk.mesh);
+    }
+    if (chunk.treeGroup) {
+        chunk.treeGroup.traverse(c => {
+            if (c.geometry) c.geometry.dispose();
+            if (c.material) c.material.dispose();
+        });
+        scene.remove(chunk.treeGroup);
+    }
+    if (chunk.waterMesh) {
+        chunk.waterMesh.geometry.dispose();
+        chunk.waterMesh.material.dispose();
+        scene.remove(chunk.waterMesh);
+    }
+}
+
+function getLOD(cx, cz, bcx, bcz) {
+    const dx = cx - bcx, dz = cz - bcz;
+    return Math.sqrt(dx * dx + dz * dz) < LOD_INNER ? CHUNK_SEG_NEAR : CHUNK_SEG_FAR;
+}
+
+function scheduleChunk(cx, cz) {
+    const k = genChunkKey(cx, cz);
+    if (chunks.has(k) || chunkQueue.some(q => q.k === k)) return;
+    chunkQueue.push({ cx, cz, k });
+}
+
+function processQueue() {
+    let done = 0;
+    while (chunkQueue.length > 0 && done < MAX_CHUNK_OPS) {
+        const { cx, cz, k } = chunkQueue.shift();
+        if (chunks.has(k)) continue;
+        const bcx = Math.round(phys.pos.x / CHUNK_SIZE);
+        const bcz = Math.round(phys.pos.z / CHUNK_SIZE);
+        const segs = getLOD(cx, cz, bcx, bcz);
+        const chunk = createChunkMesh(cx, cz, segs);
+        chunk.treeGroup = createChunkTrees(cx, cz, segs);
+
+        const half = CHUNK_SIZE / 2;
+        let hasWater = false;
+        for (let lx = -half; lx <= half; lx += CHUNK_SIZE / 4) {
+            for (let lz = -half; lz <= half; lz += CHUNK_SIZE / 4) {
+                if (getTerrainHeight(lx + cx * CHUNK_SIZE, lz + cz * CHUNK_SIZE) < params.waterLevel) {
+                    hasWater = true;
+                    break;
+                }
+            }
+            if (hasWater) break;
+        }
+        if (hasWater) {
+            const wGeo = new THREE.PlaneGeometry(CHUNK_SIZE, CHUNK_SIZE);
+            wGeo.rotateX(-Math.PI / 2);
+            const wMat = new THREE.MeshStandardMaterial({
+                color: 0x2196F3, transparent: true, opacity: 0.65,
+                roughness: 0.1, metalness: 0.35, side: THREE.DoubleSide,
+            });
+            const wMesh = new THREE.Mesh(wGeo, wMat);
+            wMesh.position.set(cx * CHUNK_SIZE, params.waterLevel + 0.3, cz * CHUNK_SIZE);
+            wMesh.frustumCulled = true;
+            scene.add(wMesh);
+            chunk.waterMesh = wMesh;
+        }
+
+        chunks.set(k, chunk);
+        done++;
+    }
+}
+
+function updateChunks() {
+    const bcx = Math.round(phys.pos.x / CHUNK_SIZE);
+    const bcz = Math.round(phys.pos.z / CHUNK_SIZE);
+    const rd = params.renderDist;
+
+    for (let dx = -rd; dx <= rd; dx++) {
+        for (let dz = -rd; dz <= rd; dz++) {
+            if (dx * dx + dz * dz <= (rd + 0.5) * (rd + 0.5)) {
+                scheduleChunk(bcx + dx, bcz + dz);
+            }
+        }
+    }
+
+    for (const [k, chunk] of chunks) {
+        const [cx, cz] = k.split(',').map(Number);
+        const dx = cx - bcx, dz = cz - bcz;
+        if (dx * dx + dz * dz > (rd + 2) * (rd + 2)) {
+            disposeChunk(chunk);
+            chunks.delete(k);
+        }
+    }
+
+    for (const [k, chunk] of chunks) {
+        const [cx, cz] = k.split(',').map(Number);
+        const desired = getLOD(cx, cz, bcx, bcz);
+        if (chunk.segs !== desired && chunkQueue.length < 10) {
+            disposeChunk(chunk);
+            chunks.delete(k);
+            scheduleChunk(cx, cz);
+        }
+    }
+
+    processQueue();
+}
+
+const waterPlaneGeo = new THREE.PlaneGeometry(3000, 3000, 64, 64);
+waterPlaneGeo.rotateX(-Math.PI / 2);
+const waterPlaneMat = new THREE.MeshStandardMaterial({
+    color: 0x1976D2, transparent: true, opacity: 0.72,
+    roughness: 0.05, metalness: 0.4, side: THREE.DoubleSide,
+});
+const waterPlane = new THREE.Mesh(waterPlaneGeo, waterPlaneMat);
+waterPlane.position.y = params.waterLevel;
+waterPlane.frustumCulled = false;
+scene.add(waterPlane);
+
+const cloudGeo = new THREE.SphereGeometry(1, 8, 6);
+const cloudMat = new THREE.MeshStandardMaterial({
+    color: 0xffffff, transparent: true, opacity: 0.7,
+    roughness: 1.0, metalness: 0.0, depthWrite: false,
+});
+const cloudMesh = new THREE.InstancedMesh(cloudGeo, cloudMat, MAX_CLOUDS);
+cloudMesh.frustumCulled = false;
+scene.add(cloudMesh);
+const CLOUD_SHAPES = [
+    { sx: 8, sy: 2, sz: 6 },
+    { sx: 3, sy: 1, sz: 2.5 },
+    { sx: 10, sy: 0.5, sz: 4 },
+    { sx: 5, sy: 3, sz: 5 },
+    { sx: 2, sy: 0.4, sz: 1.5 },
+    { sx: 6, sy: 1.5, sz: 4 },
+    { sx: 9, sy: 2.5, sz: 7 },
+    { sx: 4, sy: 0.3, sz: 3 },
+    { sx: 12, sy: 2, sz: 8 },
+    { sx: 2.5, sy: 0.8, sz: 2 },
+];
+const cloudPositions = [];
+for (let i = 0; i < MAX_CLOUDS; i++) {
+    const shape = CLOUD_SHAPES[Math.floor(Math.random() * CLOUD_SHAPES.length)];
+    const vary = () => 0.8 + Math.random() * 0.4;
+    cloudPositions.push({
+        angle: Math.random() * Math.PI * 2,
+        radius: 180 + Math.random() * 350,
+        y: 140 + Math.random() * 60,
+        speed: 0.02 + Math.random() * 0.04,
+        scaleX: shape.sx * vary(),
+        scaleY: shape.sy * vary(),
+        scaleZ: shape.sz * vary(),
+    });
+}
+
+function updateClouds() {
+    const dummy = new THREE.Object3D();
+    const activeCount = Math.min(MAX_CLOUDS, params.cloudCount);
+    cloudMesh.count = activeCount;
+
+    for (let i = 0; i < activeCount; i++) {
+        const cp = cloudPositions[i];
+        cp.angle += cp.speed * 0.01;
+        const wx = phys.pos.x + Math.cos(cp.angle) * cp.radius;
+        const wz = phys.pos.z + Math.sin(cp.angle) * cp.radius;
+
+        dummy.position.set(wx, cp.y, wz);
+        dummy.scale.set(cp.scaleX, cp.scaleY, cp.scaleZ);
+        dummy.updateMatrix();
+        cloudMesh.setMatrixAt(i, dummy.matrix);
+    }
+    cloudMesh.instanceMatrix.needsUpdate = true;
+}
+
+function updateAtmosphere() {
+    const t = params.timeOfDay;
+    const sunAngle = ((t - 5) / 14) * Math.PI;
+    const sunH = Math.sin(sunAngle);
+    const sunVisible = Math.max(0, sunH);
+
+    sunLight.position.set(
+        Math.cos(sunAngle) * 300,
+        Math.max(sunH * 300, 10),
+        120
+    );
+    sunLight.intensity = sunVisible * 1.6;
+
+    const warmth = Math.max(0, 1 - Math.abs(t - 12) / 5);
+    sunLight.color.setHSL(0.08 + warmth * 0.015, 0.85, 0.55 + sunVisible * 0.3);
+
+    ambientLight.intensity = 0.12 + sunVisible * 0.35;
+
+    const skyH = 0.55;
+    const skyS = 0.45 + sunVisible * 0.25;
+    const skyL = 0.08 + sunVisible * 0.52;
+    const skyColor = new THREE.Color().setHSL(skyH, skyS, skyL);
+
+    scene.background.copy(skyColor);
+    scene.fog.color.copy(skyColor);
+    scene.fog.density = params.fogDensity;
+
+    waterPlaneMat.color.setHSL(0.57, 0.6, 0.15 + sunVisible * 0.25);
+    waterPlaneMat.opacity = 0.55 + sunVisible * 0.2;
+}
+
+const gui = new GUI({ width: 280 });
+gui.domElement.style.position = 'fixed';
+gui.domElement.style.left = '10px';
+gui.domElement.style.top = '10px';
+gui.domElement.style.maxHeight = 'calc(100vh - 20px)';
+gui.domElement.style.overflowY = 'auto';
+
+const fTerrain = gui.addFolder('Terrain');
+fTerrain.add(params, 'noiseScale', 0.002, 0.025).name('Noise Scale');
+fTerrain.add(params, 'elevation', 20, 200).name('Elevation');
+fTerrain.add(params, 'waterLevel', -20, 40).name('Water Level');
+fTerrain.add(params, 'snowLine', 30, 150).name('Snow Line');
+
+const fEnv = gui.addFolder('Environment');
+fEnv.add(params, 'fogDensity', 0.0005, 0.02).name('Fog Density');
+fEnv.addColor(params, 'fogColor').name('Fog Color');
+fEnv.add(params, 'cloudCount', 10, MAX_CLOUDS).step(1).name('Cloud Count');
+fEnv.add(params, 'timeOfDay', 0, 24).step(0.1).name('Time of Day');
+fEnv.add(params, 'gravity', 2, 40).step(0.5).name('Gravity');
+
+const fPerf = gui.addFolder('Performance');
+fPerf.add(params, 'renderDist', 2, 10).step(1).name('Render Dist');
+
+const worldActions = { regenerate() {
+    for (const [, c] of chunks) disposeChunk(c);
+    chunks.clear();
+    chunkQueue = [];
+    noise2D = createNoise2D();
+    treeNoise2D = createNoise2D();
+
+    const newGH = getTerrainHeight(phys.pos.x, phys.pos.z);
+    phys.pos.y = Math.max(newGH + 40, params.waterLevel + 40);
+    phys.vY = 0;
+    phys.speed = 30;
+    phys.pitch = 0;
+    phys.roll = 0;
+
+    camState.currentPos.copy(phys.pos).add(new THREE.Vector3(0, 9, -20));
+    camState.currentLook.copy(phys.pos).add(new THREE.Vector3(0, 0, 12));
+
+    const bcx = Math.round(phys.pos.x / CHUNK_SIZE);
+    const bcz = Math.round(phys.pos.z / CHUNK_SIZE);
+    const rd = params.renderDist;
+    for (let dx = -rd; dx <= rd; dx++) {
+        for (let dz = -rd; dz <= rd; dz++) {
+            if (dx * dx + dz * dz <= (rd + 0.5) * (rd + 0.5)) {
+                scheduleChunk(bcx + dx, bcz + dz);
+            }
+        }
+    }
+    processQueue();
+    processQueue();
+}};
+gui.add(worldActions, 'regenerate').name('Regenerate World');
+
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+const fpsEl = document.getElementById('fps');
+const statsEl = document.getElementById('stats');
+let frameCount = 0, lastFpsTime = performance.now();
+
+function animate() {
+    requestAnimationFrame(animate);
+    const dt = Math.min(clock.getDelta(), 0.05);
+
+    if (!paused) {
+        updatePhysics(dt);
+        updateBirdModel(dt);
+        updateCamera(dt);
+    }
+    updateChunks();
+    updateClouds();
+    updateAtmosphere();
+
+    waterPlane.position.x = phys.pos.x;
+    waterPlane.position.z = phys.pos.z;
+    waterPlane.position.y = params.waterLevel;
+
+    const waveT = clock.elapsedTime;
+    const waveVerts = waterPlaneGeo.attributes.position;
+    for (let i = 0; i < waveVerts.count; i++) {
+        const x = waveVerts.getX(i) + phys.pos.x;
+        const z = waveVerts.getZ(i) + phys.pos.z;
+        const wave = Math.sin(x * 0.03 + waveT * 1.5) * 0.8
+                   + Math.sin(z * 0.025 + waveT * 1.2) * 0.6
+                   + Math.sin((x + z) * 0.02 + waveT * 0.8) * 0.4;
+        waveVerts.setY(i, wave);
+    }
+    waveVerts.needsUpdate = true;
+
+    renderer.render(scene, camera);
+
+    frameCount++;
+    const now = performance.now();
+    if (now - lastFpsTime > 500) {
+        const fps = Math.round(frameCount / ((now - lastFpsTime) / 1000));
+        fpsEl.textContent = fps + ' FPS | Chunks: ' + chunks.size;
+        statsEl.textContent = `Speed: ${Math.round(phys.speed)} | Alt: ${Math.round(phys.pos.y)} | Heading: ${Math.round(THREE.MathUtils.radToDeg(phys.yaw) % 360)}°`;
+        frameCount = 0;
+        lastFpsTime = now;
+    }
+}
+
+function init() {
+    const startY = Math.max(getTerrainHeight(0, 0) + 35, params.waterLevel + 35);
+    phys.pos.set(0, startY, 0);
+    phys.speed = 30;
+
+    camState.currentPos.set(0, startY + 9, -20);
+    camState.currentLook.set(0, startY, 12);
+
+    for (let dx = -params.renderDist; dx <= params.renderDist; dx++) {
+        for (let dz = -params.renderDist; dz <= params.renderDist; dz++) {
+            if (dx * dx + dz * dz <= (params.renderDist + 0.5) * (params.renderDist + 0.5)) {
+                scheduleChunk(dx, dz);
+            }
+        }
+    }
+
+    updateClouds();
+    animate();
+}
+
+init();
+    </script>
+</body>
+</html>
