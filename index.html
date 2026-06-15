@@ -84,6 +84,72 @@ canvas { display: block; }
 @keyframes pulse {
   0%,100% { opacity: 1; } 50% { opacity: 0.4; }
 }
+
+/* ── Touch UI (mobile only — hidden by default, shown via JS on detection) ── */
+#touch-ui { display: none; }
+
+/* Joystick */
+#joystick-zone {
+  position: fixed; bottom: 28px; left: 28px; z-index: 50;
+  width: 130px; height: 130px;
+  touch-action: none; user-select: none;
+}
+#joystick-base {
+  width: 130px; height: 130px; border-radius: 50%;
+  background: rgba(255,255,255,0.08);
+  border: 2px solid rgba(255,255,255,0.22);
+  position: absolute;
+}
+#joystick-knob {
+  width: 52px; height: 52px; border-radius: 50%;
+  background: rgba(255,255,255,0.30);
+  border: 2px solid rgba(255,255,255,0.55);
+  position: absolute;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  transition: background 0.1s;
+}
+
+/* Action buttons */
+#action-btns {
+  position: fixed; bottom: 28px; right: 28px; z-index: 50;
+  display: flex; flex-direction: column; gap: 18px;
+  touch-action: none; user-select: none;
+}
+.action-btn {
+  width: 68px; height: 68px; border-radius: 50%;
+  font-size: 26px; font-weight: bold;
+  display: flex; align-items: center; justify-content: center;
+  border: 2px solid rgba(255,255,255,0.4);
+  color: #fff; cursor: pointer;
+  user-select: none; -webkit-user-select: none;
+  touch-action: none;
+  transition: transform 0.08s, opacity 0.08s;
+}
+.action-btn:active { transform: scale(0.92); opacity: 0.75; }
+#btn-flap { background: rgba(50,130,255,0.55); }
+#btn-dive { background: rgba(255,120,30,0.55);  }
+
+/* Mobile pause button */
+#mobile-pause-btn {
+  position: fixed; top: 18px; left: 50%; transform: translateX(-50%);
+  z-index: 50;
+  width: 52px; height: 52px; border-radius: 50%;
+  background: rgba(0,0,0,0.5);
+  border: 1.5px solid rgba(255,255,255,0.35);
+  color: #fff; font-size: 22px;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; touch-action: manipulation;
+}
+
+/* Mobile controls hint (replaces keyboard panel) */
+#mobile-controls-hint {
+  position: fixed; top: 20px; right: 20px;
+  color: #eee; font-family: monospace; font-size: 11px;
+  background: rgba(0,0,0,0.6); padding: 10px 14px; border-radius: 6px;
+  pointer-events: none; z-index: 10; line-height: 1.8;
+}
 </style>
 </head>
 <body>
@@ -108,7 +174,15 @@ canvas { display: block; }
       <span class="key-desc">Pause / Resume</span>
     </div>
     <hr class="divider"/>
-    <p class="press-space">▶ &nbsp; PRESS SPACE TO FLY &nbsp; ◀</p>
+    <!-- Desktop prompt -->
+    <p class="press-space" id="modal-space-prompt">▶ &nbsp; PRESS SPACE TO FLY &nbsp; ◀</p>
+    <!-- Mobile prompt (shown by JS when mobile detected) -->
+    <button id="modal-tap-btn" style="display:none;
+      margin: 0 auto; padding: 14px 40px; font-size: 17px; font-weight: bold;
+      background: rgba(80,160,255,0.7); color: #fff; border: 2px solid rgba(255,255,255,0.4);
+      border-radius: 30px; cursor: pointer; letter-spacing: 0.08em; font-family: 'Courier New', monospace;">
+      ▶ &nbsp; TAP TO FLY
+    </button>
     <p class="hint">Use the panel on the left to tweak terrain, biomes &amp; physics</p>
   </div>
 </div>
@@ -128,9 +202,36 @@ canvas { display: block; }
   color:#fff; font-family:monospace; font-size:32px; font-weight:bold;
   align-items:center; justify-content:center; flex-direction:column; z-index:20; gap:14px;">
   <span>⏸ PAUSED</span>
-  <span style="font-size:15px; font-weight:normal; opacity:0.75;">Press Space to resume</span>
+  <span id="pause-resume-hint" style="font-size:15px; font-weight:normal; opacity:0.75;">Press Space to resume</span>
 </div>
 <div id="perf-hud" style="display:none">FPS: --<br>Chunks: --</div>
+
+<!-- ── Touch UI (shown only on mobile, hidden by JS on desktop) ── -->
+<div id="touch-ui">
+  <!-- Virtual joystick -->
+  <div id="joystick-zone">
+    <div id="joystick-base"></div>
+    <div id="joystick-knob"></div>
+  </div>
+
+  <!-- Flap / Dive buttons -->
+  <div id="action-btns">
+    <div class="action-btn" id="btn-flap">🪶</div>
+    <div class="action-btn" id="btn-dive">↓</div>
+  </div>
+
+  <!-- Pause button -->
+  <div id="mobile-pause-btn">⏸</div>
+
+  <!-- Mobile controls hint -->
+  <div id="mobile-controls-hint" style="display:none">
+    <b>Controls</b><br>
+    Joystick — steer / pitch<br>
+    🪶 — Flap (ascend)<br>
+    ↓ — Dive<br>
+    ⏸ — Pause
+  </div>
+</div>
 
 <!-- Tone.js for MIDI audio (must be classic script, not module) -->
 <script src="https://cdn.jsdelivr.net/npm/tone@14.8.49/build/Tone.js"></script>
@@ -205,15 +306,16 @@ async function initAudio() {
   try {
     await Tone.start();
 
-    // Fetch MIDI file directly from the source repo
-    const resp = await fetch('https://raw.githubusercontent.com/jenghow/flying-bird-threejs/main/index.html');
-    const html = await resp.text();
-    const m = html.match(/const MIDI_B64 = '([^']+)'/);
-    if (!m) throw new Error('MIDI_B64 not found in source');
-    const raw = atob(m[1]);
-    const ab  = new Uint8Array(raw.length);
-    for (let i = 0; i < raw.length; i++) ab[i] = raw.charCodeAt(i);
-    const { notes, duration, bpm } = parseMidi(ab.buffer);
+    // Load the local MIDI binary file
+    const resp = await fetch('./music.mid');
+    if (!resp.ok) throw new Error(`Failed to load music.mid: ${resp.status}`);
+    const ab = await resp.arrayBuffer();
+
+    // Verify MIDI header
+    const header = String.fromCharCode(...new Uint8Array(ab, 0, 4));
+    if (header !== 'MThd') throw new Error('Not a valid MIDI file');
+
+    const { notes, duration, bpm } = parseMidi(ab);
 
     audioSynth = new Tone.PolySynth(Tone.Synth, {
       oscillator: { type: 'triangle' },
@@ -508,8 +610,9 @@ addEventListener('keydown', e => {
       paused  = false;
       document.getElementById('start-modal').style.display   = 'none';
       document.getElementById('hud').style.display           = '';
-      document.getElementById('controls-help').style.display = '';
       document.getElementById('perf-hud').style.display      = '';
+      // Only show keyboard hint on desktop
+      if (!isMobile) document.getElementById('controls-help').style.display = '';
       initAudio();
       e.preventDefault();
       return;
@@ -525,6 +628,125 @@ addEventListener('keydown', e => {
   e.preventDefault();
 });
 addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+// ─────────────────────────────────────────────
+// MOBILE DETECTION & TOUCH CONTROLS
+// ─────────────────────────────────────────────
+const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
+              || navigator.maxTouchPoints > 1
+              || window.matchMedia('(pointer: coarse)').matches;
+
+if (isMobile) {
+  // Show touch UI, hide keyboard hint
+  document.getElementById('touch-ui').style.display = 'block';
+  document.getElementById('pause-resume-hint').textContent = 'Tap ⏸ to resume';
+
+  // Swap modal prompt
+  document.getElementById('modal-space-prompt').style.display = 'none';
+  document.getElementById('modal-tap-btn').style.display = 'block';
+
+  // canvas: prevent browser scroll/pinch-zoom interference
+  document.querySelector('canvas') && (document.querySelector('canvas').style.touchAction = 'none');
+
+  // ── Helper: start game (shared by tap button + joystick first touch) ──
+  function startGame() {
+    if (started) return;
+    started = true;
+    paused  = false;
+    document.getElementById('start-modal').style.display   = 'none';
+    document.getElementById('hud').style.display           = '';
+    document.getElementById('perf-hud').style.display      = '';
+    document.getElementById('mobile-controls-hint').style.display = '';
+    initAudio();
+  }
+
+  // "TAP TO FLY" button
+  document.getElementById('modal-tap-btn').addEventListener('touchstart', e => {
+    e.preventDefault();
+    startGame();
+  }, { passive: false });
+
+  // ── Mobile pause button ──
+  document.getElementById('mobile-pause-btn').addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (!started) { startGame(); return; }
+    paused = !paused;
+    document.getElementById('pause-overlay').style.display = paused ? 'flex' : 'none';
+    setAudioPaused(paused);
+  }, { passive: false });
+
+  // ── Virtual Joystick ──
+  const zone  = document.getElementById('joystick-zone');
+  const knob  = document.getElementById('joystick-knob');
+  const RADIUS = 39;   // max knob travel from centre (px)
+  let joystickId = null, zoneRect = null;
+  let jx = 0, jy = 0;  // normalised -1..1 per axis
+
+  function joystickMove(cx, cy) {
+    const bx = zoneRect.left + zoneRect.width  * 0.5;
+    const by = zoneRect.top  + zoneRect.height * 0.5;
+    let dx = cx - bx, dy = cy - by;
+    const dist = Math.sqrt(dx*dx + dy*dy);
+    if (dist > RADIUS) { dx = dx/dist*RADIUS; dy = dy/dist*RADIUS; }
+    knob.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
+    jx =  dx / RADIUS;   // left(-1) / right(+1)
+    jy = -dy / RADIUS;   // down(-1) / up(+1)
+
+    // Map to keys
+    keys['a'] = jx < -0.25;
+    keys['d'] = jx >  0.25;
+    keys['w'] = jy >  0.25;
+    keys['s'] = jy < -0.25;
+  }
+
+  function joystickReset() {
+    joystickId = null; jx = 0; jy = 0;
+    knob.style.transform = 'translate(-50%, -50%)';
+    keys['a'] = keys['d'] = keys['w'] = keys['s'] = false;
+  }
+
+  zone.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (!started) startGame();
+    const t = e.changedTouches[0];
+    joystickId = t.identifier;
+    zoneRect = zone.getBoundingClientRect();
+    joystickMove(t.clientX, t.clientY);
+  }, { passive: false });
+
+  zone.addEventListener('touchmove', e => {
+    e.preventDefault();
+    for (const t of e.changedTouches) {
+      if (t.identifier === joystickId) { joystickMove(t.clientX, t.clientY); break; }
+    }
+  }, { passive: false });
+
+  zone.addEventListener('touchend',    e => { e.preventDefault(); joystickReset(); }, { passive: false });
+  zone.addEventListener('touchcancel', e => { e.preventDefault(); joystickReset(); }, { passive: false });
+
+  // ── Flap button (E) ──
+  const btnFlap = document.getElementById('btn-flap');
+  btnFlap.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (!started) startGame();
+    keys['e'] = true;
+  }, { passive: false });
+  btnFlap.addEventListener('touchend',    e => { e.preventDefault(); keys['e'] = false; }, { passive: false });
+  btnFlap.addEventListener('touchcancel', e => { e.preventDefault(); keys['e'] = false; }, { passive: false });
+
+  // ── Dive button (Q) ──
+  const btnDive = document.getElementById('btn-dive');
+  btnDive.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (!started) startGame();
+    keys['q'] = true;
+  }, { passive: false });
+  btnDive.addEventListener('touchend',    e => { e.preventDefault(); keys['q'] = false; }, { passive: false });
+  btnDive.addEventListener('touchcancel', e => { e.preventDefault(); keys['q'] = false; }, { passive: false });
+
+  // lil-gui: collapse by default on mobile (applied after GUI is created below)
+  window._mobileCollapseGui = true;
+}
 
 function updateBird(dt) {
   const s = state;
@@ -859,6 +1081,9 @@ pF.add(params, 'chunkRenderDistance', 2, 10, 1).name('Render Distance');
 
 const phF = gui.addFolder('🪂 Physics');
 phF.add(params, 'gravityScale', 0.0, 3.0, 0.05).name('Gravity Scale');
+
+// Collapse GUI by default on mobile
+if (window._mobileCollapseGui) gui.close();
 
 // ─────────────────────────────────────────────
 // MAIN LOOP
