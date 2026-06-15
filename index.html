@@ -297,25 +297,35 @@ function parseMidi(buf) {
   return { notes, duration: lastTime, bpm: 60e6 / curTempo };
 }
 
-// ── Embedded MIDI (from jenghow/flying-bird-threejs, OpenCode) ──
-// Fetched at runtime to avoid base64 corruption from file editing
+// ── Audio — pre-fetch MIDI on page load so it's ready when the user taps ──
 let audioReady = false, audioSynth = null, audioPart = null;
+let _midiBuffer = null;   // pre-fetched ArrayBuffer
 
+// Start fetching immediately — no gesture needed for fetch, only for AudioContext
+fetch('./music.mid')
+  .then(r => r.ok ? r.arrayBuffer() : Promise.reject(r.status))
+  .then(ab => { _midiBuffer = ab; })
+  .catch(e => console.warn('MIDI pre-fetch failed:', e));
+
+// Called inside a user gesture — AudioContext unlock must happen here
 async function initAudio() {
   if (audioReady) return;
   try {
-    await Tone.start();
+    // Step 1: unlock AudioContext SYNCHRONOUSLY inside the gesture.
+    // Tone.start() returns a promise but the unlock happens on the same tick.
+    const startPromise = Tone.start();
 
-    // Load the local MIDI binary file
-    const resp = await fetch('./music.mid');
-    if (!resp.ok) throw new Error(`Failed to load music.mid: ${resp.status}`);
-    const ab = await resp.arrayBuffer();
+    // Step 2: wait for MIDI data (almost certainly already loaded)
+    if (!_midiBuffer) {
+      // Fallback: fetch now if pre-fetch somehow didn't complete
+      const r = await fetch('./music.mid');
+      _midiBuffer = await r.arrayBuffer();
+    }
 
-    // Verify MIDI header
-    const header = String.fromCharCode(...new Uint8Array(ab, 0, 4));
-    if (header !== 'MThd') throw new Error('Not a valid MIDI file');
+    // Step 3: wait for AudioContext to fully resume
+    await startPromise;
 
-    const { notes, duration, bpm } = parseMidi(ab);
+    const { notes, duration, bpm } = parseMidi(_midiBuffer);
 
     audioSynth = new Tone.PolySynth(Tone.Synth, {
       oscillator: { type: 'triangle' },
