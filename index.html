@@ -133,7 +133,7 @@ canvas { display: block; }
 
 /* Mobile pause button */
 #mobile-pause-btn {
-  position: fixed; top: 18px; left: 50%; transform: translateX(-50%);
+  position: fixed; top: 18px; left: 18px;
   z-index: 50;
   width: 52px; height: 52px; border-radius: 50%;
   background: rgba(0,0,0,0.5);
@@ -677,10 +677,12 @@ if (isMobile) {
   }, { passive: false });
 
   // ── Mobile pause button ──
-  document.getElementById('mobile-pause-btn').addEventListener('touchstart', e => {
+  const mobilePauseBtn = document.getElementById('mobile-pause-btn');
+  mobilePauseBtn.addEventListener('touchstart', e => {
     e.preventDefault();
     if (!started) { startGame(); return; }
     paused = !paused;
+    mobilePauseBtn.textContent = paused ? '▶' : '⏸';
     document.getElementById('pause-overlay').style.display = paused ? 'flex' : 'none';
     setAudioPaused(paused);
   }, { passive: false });
