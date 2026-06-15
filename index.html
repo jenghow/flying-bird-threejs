@@ -299,61 +299,79 @@ function parseMidi(buf) {
 
 // ── Audio — pre-fetch MIDI on page load so it's ready when the user taps ──
 let audioReady = false, audioSynth = null, audioPart = null;
-let _midiBuffer = null;   // pre-fetched ArrayBuffer
+let _midiBuffer = null;
 
-// Start fetching immediately — no gesture needed for fetch, only for AudioContext
+// Fetch MIDI immediately — network fetch doesn't need a gesture
 fetch('./music.mid')
   .then(r => r.ok ? r.arrayBuffer() : Promise.reject(r.status))
   .then(ab => { _midiBuffer = ab; })
   .catch(e => console.warn('MIDI pre-fetch failed:', e));
 
-// Called inside a user gesture — AudioContext unlock must happen here
-async function initAudio() {
+// unlockAndInit: call this directly inside a touchstart/click handler.
+// Step 1 is fully synchronous (AudioContext creation + resume),
+// which is what mobile browsers require.
+function unlockAndInit() {
   if (audioReady) return;
-  try {
-    // Step 1: unlock AudioContext SYNCHRONOUSLY inside the gesture.
-    // Tone.start() returns a promise but the unlock happens on the same tick.
-    const startPromise = Tone.start();
 
-    // Step 2: wait for MIDI data (almost certainly already loaded)
-    if (!_midiBuffer) {
-      // Fallback: fetch now if pre-fetch somehow didn't complete
+  // Create / resume the Web Audio context SYNCHRONOUSLY inside the gesture.
+  // Then hand it to Tone so it reuses the same context.
+  let ctx;
+  try {
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    ctx.resume(); // synchronous intent — no await
+  } catch(e) {
+    console.warn('AudioContext creation failed:', e);
+    return;
+  }
+
+  // Tell Tone.js to use our already-unlocked context
+  Tone.setContext(ctx);
+
+  // Now do the async setup (context is already unlocked, so this is fine)
+  _setupAudio().catch(e => console.warn('Audio setup failed:', e));
+}
+
+async function _setupAudio() {
+  // Wait for context to fully resume (usually instant since we called resume() above)
+  await Tone.context.resume();
+
+  // Wait for MIDI buffer if still loading
+  if (!_midiBuffer) {
+    try {
       const r = await fetch('./music.mid');
       _midiBuffer = await r.arrayBuffer();
+    } catch(e) {
+      console.warn('MIDI fallback fetch failed:', e);
+      return;
     }
+  }
 
-    // Step 3: wait for AudioContext to fully resume
-    await startPromise;
+  const { notes, duration, bpm } = parseMidi(_midiBuffer);
 
-    const { notes, duration, bpm } = parseMidi(_midiBuffer);
+  audioSynth = new Tone.PolySynth(Tone.Synth, {
+    oscillator: { type: 'triangle' },
+    envelope: { attack: 0.02, decay: 0.25, sustain: 0.35, release: 1.4 }
+  }).toDestination();
+  audioSynth.volume.value = -12;
 
-    audioSynth = new Tone.PolySynth(Tone.Synth, {
-      oscillator: { type: 'triangle' },
-      envelope: { attack: 0.02, decay: 0.25, sustain: 0.35, release: 1.4 }
-    }).toDestination();
-    audioSynth.volume.value = -12;
+  audioPart = new Tone.Part((time, note) => {
+    audioSynth.triggerAttackRelease(note.name, note.dur, time, note.vel);
+  }, notes.map(n => [n.time, { name: midiNoteName(n.note), dur: n.duration, vel: n.vel }]));
 
-    const events = notes.map(n => [
-      n.time,
-      { name: midiNoteName(n.note), dur: n.duration, vel: n.vel }
-    ]);
+  audioPart.loop    = true;
+  audioPart.loopEnd = duration;
+  audioPart.start(0);
 
-    audioPart = new Tone.Part((time, note) => {
-      audioSynth.triggerAttackRelease(note.name, note.dur, time, note.vel);
-    }, events);
-
-    audioPart.loop    = true;
-    audioPart.loopEnd = duration;
-    audioPart.start(0);
-
-    Tone.Transport.bpm.value = bpm;
-    Tone.Transport.loop      = true;
-    Tone.Transport.loopStart = 0;
-    Tone.Transport.loopEnd   = duration;
-    Tone.Transport.start('+0.05');
-    audioReady = true;
-  } catch(e) { console.warn('Audio init failed:', e); }
+  Tone.Transport.bpm.value = bpm;
+  Tone.Transport.loop      = true;
+  Tone.Transport.loopStart = 0;
+  Tone.Transport.loopEnd   = duration;
+  Tone.Transport.start('+0.1');
+  audioReady = true;
 }
+
+// Public entry point — called from both keyboard and touch handlers
+function initAudio() { unlockAndInit(); }
 
 function setAudioPaused(p) {
   if (!audioReady) return;
